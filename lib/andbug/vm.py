@@ -237,7 +237,28 @@ class Thread(SessionElement):
         code, buf = conn.request(0x0b03, buf.data())
         if code != 0:
             raise RequestError(code)
+        #add by sq.luo
+        #self.sess.suspendState.resume(self.sess)
+    #add by sq.luo  
+    def singleStep(self, func = None, queue = None, stepdepth = 1):
+        suspendState = self.sess.suspendState
+        if suspendState.set:
+            self.sess.emap[suspendState.eid].clear()
+        conn = self.conn
+        buf = conn.buffer()
+        # 1:SINGLE_STEP, 1: SP_THREAD, 1: modifers 10: condition of Step 
+        # 1: Step size :Line 1: stepdepth: over
 
+        buf.pack('11i1tii', 1, 1, 1, 10, self.tid, 1, stepdepth) 
+        code, buf = conn.request(0x0f01, buf.data())
+        if code != 0:
+            raise RequestError(code)
+        eid = buf.unpackInt()
+        self.sess.suspendState.setBreakPoint(eid, stepdepth)
+        h = self.sess.hook(eid, func, queue, self)
+        self.resume();
+        return h
+    
     def packTo(self, buf):
         buf.packObjectId(self.tid)
 
@@ -336,6 +357,8 @@ class Location(SessionElement):
         self.line = None
 
     def __str__(self):
+        if self.line != None:
+            return '%s:%i: smali line: %i' % (self.method, self.loc, self.line)
         if self.loc >= 0:
             return '%s:%i' % (self.method, self.loc)
         else:
@@ -347,6 +370,7 @@ class Location(SessionElement):
 
     @classmethod
     def unpackFrom(impl, sess, buf):
+        #modified by shiqi Luo
         tag, tid, mid, loc = buf.unpack('1tm8')
         return sess.pool(impl, sess, tid, mid, loc)
 
@@ -441,7 +465,7 @@ class Method(SessionElement):
         return '<method %s>' % self
 
     def load_line_table(self):
-        sess = self.sess
+        sess = self.sess 
         conn = sess.conn
         pool = sess.pool
         tid = self.tid
@@ -632,10 +656,16 @@ class RefType(SessionElement):
     methodByJni = defer(load_methods, 'methodByJni')
     methodByName = defer(load_methods, 'methodByName')
 
-    def methods(self, name=None, jni=None):
+    def methods(self, name=None, jni=None, filtername=None):
         if name and jni:
             seq = self.methodByName[name]
             seq = filter(x in seq, self.methodByJni[jni])
+        elif filtername:
+            list = []
+            for key in self.methodByName.keys():
+                if key.find(filtername) != -1:
+                    list.append(self.methodByName[key])
+            seq = andbug.data.view(list)
         elif name:
             seq = andbug.data.view(self.methodByName[name])
         elif jni:
@@ -667,12 +697,14 @@ class Class(RefType):
         buf = conn.buffer()
         # 40:EK_METHOD_ENTRY, 1: SP_THREAD, 1 condition of type ClassRef (4)
         buf.pack('11i1t', 40, 1, 1, 4, self.tid) 
+        data = buf.data()
+        print repr(data)
         code, buf = conn.request(0x0f01, buf.data())
         if code != 0:
             raise RequestError(code)
         eid = buf.unpackInt()
         return self.sess.hook(eid, func, queue, self)
-        
+
     #def load_class(self):
     #   self.sess.load_classes()
     #   assert self.tag != None
@@ -747,6 +779,8 @@ def unpack_event_location(sess, buf):
     loc = Location.unpackFrom(sess, buf)
     return rid, t, loc
 
+# Single Step
+register_unpack_impl(1, unpack_event_location)
 # Breakpoint
 register_unpack_impl(2, unpack_event_location)
 # MothodEntry
@@ -754,6 +788,39 @@ register_unpack_impl(40, unpack_event_location)
 # MothodExit
 register_unpack_impl(41, unpack_event_location)
 
+
+#add by sq.luo  
+class SuspendState(object):
+    def __init__(self):
+        self.isSuspend = False
+        self.thread = None
+        self.location = None
+        self.set = False
+        self.eid = 0
+    def suspend(self, data):
+        self.isSuspend = True
+        if len(data) >= 2:
+            self.thread = data[0]
+            self.location = data[1]
+        
+    def resume(self, sess):
+        self.isSuspend = False
+        self.thread = None
+        self.location = None
+        if self.set:
+            sess.emap[self.eid].clear()
+            self.set = False
+    def getThread(self):
+        return self.thread
+    
+    def getLocation(self):
+        return self.location
+    
+    def setBreakPoint(self, eid, stepdepth):
+        self.set = True
+        self.eid = eid
+        self.stepdepth = stepdepth
+        
 class Session(object):
     def __init__(self, conn):
         self.pool = andbug.data.pool()
@@ -761,6 +828,7 @@ class Session(object):
         self.emap = {}
         self.ectl = Lock()
         self.evtq = Queue()
+        self.suspendState = SuspendState()
         conn.hook(0x4064, self.evtq)
         self.ethd = threading.Thread(
             name='Session', target=self.run
@@ -768,6 +836,9 @@ class Session(object):
         self.ethd.daemon=1
         self.ethd.start()
 
+    def getSuspendState(self):
+        return self.suspendState
+    
     def run(self):
         while True:
             self.processEvent(*self.evtq.get())
@@ -785,10 +856,12 @@ class Session(object):
                 raise RequestError(ek)
             evt = im(self, buf)
             with self.ectl:
+                print evt[0]
                 hook = self.emap.get(evt[0])
             if hook is not None:
+                self.suspendState.suspend(evt[1:])
                 hook.put(evt[1:])
-                          
+        
     def load_classes(self):
         code, buf = self.conn.request(0x0114)
         if code != 0:
@@ -825,7 +898,7 @@ class Session(object):
         code, buf = self.conn.request(0x0108, '')
         if code != 0:
             raise RequestError(code)
-
+    
     @property
     def count(self):
         code, buf = self.conn.request(0x0108, '')
@@ -833,10 +906,12 @@ class Session(object):
             raise RequestError(code)
 
     def resume(self):
+        self.suspendState.resume(self)
         code, buf = self.conn.request(0x0109, '')
         if code != 0:
             raise RequestError(code)
-
+        
+        
     def exit(self, code = 0):
         conn = self.conn
         buf = conn.buffer()

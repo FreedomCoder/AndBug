@@ -16,11 +16,11 @@
 
 import andbug.command, andbug.options
 
-@andbug.command.action('<class-path> [<method-query>]')
+@andbug.command.action('<class-path> [<method-query>]', aliases=('m',))
 def methods(ctxt, cpath, mquery=None):
     'lists the methods of a class'
     cpath, mname, mjni = andbug.options.parse_mquery(cpath, mquery)
     title = "Methods " + ((cpath + "->" + mquery) if mquery else (cpath))
     with andbug.screed.section(title):
-    	for m in ctxt.sess.classes(cpath).methods(name=mname, jni=mjni):
+    	for m in ctxt.sess.classes(cpath).methods(filtername=mname, jni=mjni):
 	    	andbug.screed.item(str(m))

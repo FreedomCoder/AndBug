@@ -20,8 +20,9 @@ from Queue import Queue
 def report_hit(t):
     t = t[0]
     with andbug.screed.section("Breakpoint hit in %s, process suspended." % t):
-        t.sess.suspend()
-        for f in t.frames:
+        #t.sess.suspend()
+        count = 10 if len(t.frames) > 10 else len(t.frames)
+        for f in t.frames[0: count]:
             name = str(f.loc)
             if f.native:
                 name += ' <native>'

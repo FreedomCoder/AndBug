@@ -17,7 +17,7 @@
 
 import andbug.command, andbug.screed
 
-@andbug.command.action('<eid/all>', name='break-remove', shell=True)
+@andbug.command.action('<eid/all>', name='break-remove', aliases=('br',),  shell=True)
 def break_remove(ctxt, eid):
     'remove hook/breakpoint'
     ctxt.sess.suspend()
