@@ -7,8 +7,7 @@
 ## TODO: add close button to popouts
 ## TODO: add static class list
 
-import andbug, os.path, cgi, json, subprocess, threading
-from urllib2 import quote as urlquote
+import andbug, os.path, json, subprocess, threading
 import re
 
 try:
@@ -26,17 +25,19 @@ def index_seq(seq):
         yield i, seq[i]
 
 def get_threads():
+    global proc # set by navi_loop
     threads = proc.threads()[:] # TODO This workaround for view is vulgar.
     def tin(name):
         try:
             return int(re.split('<|>', name)[1])
-        except:
+        except Exception:
             return name
 
     threads.sort(lambda a, b: cmp(tin(a.name), tin(b.name)))
     return threads
 
 def get_classes():
+    global proc # set by navi_loop
     classes = proc.classes()[:] # TODO This workaround for view is vulgar.
     classes.sort(lambda a, b: cmp(a.jni, b.jni))
 
@@ -83,7 +84,7 @@ def info(value):
             return repr(value).replace('\\x00', '') # HACK
     if isinstance(value, andbug.Object):
         return object_info(value)
-    return str(value)
+    return value
     
 ############################################################## VIEW UTILITIES
 # These functions summarize various Java objects into JSON views suitable for
@@ -116,8 +117,9 @@ def view(value):
 # We use static roots derived from the location of the Navi script.
 #############################################################################
 
+# note: __file__ is injected into the module by import
 NAVI_ROOT = os.path.abspath( 
-    os.path.join( os.path.dirname( __file__ ), '..' )
+    os.path.join( os.path.dirname(__file__), '..' )
 )
 STATIC_ROOT = os.path.join( NAVI_ROOT, 'data', '' )
 COFFEE_ROOT = os.path.join( NAVI_ROOT, 'coffee', '' )
@@ -131,12 +133,6 @@ def resolve_resource(root, rsrc):
     else:
         raise Exception('Less dots next time.')
 
-def resolve_coffee_resource(root, rsrc):
-    # We do not cache this at all; since this is a single-user, one-page
-    # interface.. I give a damn.
-    
-    return data
-
 @bottle.route( '/s/:req#.*#' )
 def static_data(req):
     rsrc = resolve_resource(COFFEE_ROOT, req)  
@@ -144,7 +140,7 @@ def static_data(req):
     if rsrc.endswith('.coffee') and os.path.exists(rsrc):
         req = rsrc.replace(COFFEE_ROOT, '')[:-7] + '.js'
         try:
-            ret = subprocess.call(('coffee', '-o', STATIC_ROOT, '-c', rsrc))
+            subprocess.call(('coffee', '-o', STATIC_ROOT, '-c', rsrc))
         except OSError:
             pass # use the cached version, looks like coffee isn't working.
     return bottle.static_file(req, root=STATIC_ROOT)
@@ -156,7 +152,7 @@ def static_data(req):
 # concurrent requests.
 #############################################################################
 
-NAVI_VERNO = '0.1'
+NAVI_VERNO = '0.2'
 NAVI_VERSION = 'AndBug Navi ' + NAVI_VERNO
 
 ################################################################# THREAD AXIS
@@ -166,7 +162,7 @@ NAVI_VERSION = 'AndBug Navi ' + NAVI_VERNO
 
 def get_object_item(val, key):
     try:
-        return val.fields[key]
+        return val.field(key)
     except KeyError:
         raise bottle.HTTPError(
         code=404, output='object does not have field "%s".' % key
@@ -193,21 +189,96 @@ def get_item(val, key):
         code=404, output='cannot navigate type %s.' % type(val).__name__
     )
 
-@bottle.route('/t/:tid/:fid/:key')
-@bottle.route('/t/:tid/:fid/:key/:path#.*#')
-def view_slot(tid, fid, key, path=None):
-    'lists the values in the frame'
-    tid, fid, key = int(tid), int(fid), str(key)
+def deref_frame(tid, fid):
     threads = get_threads()
-    value = tuple(threads[tid].frames)[fid].values.get(key)
-    if path is not None:
+    return tuple(threads[tid].frames)[fid]
+
+def deref_value(tid, fid, key, path):
+    if isinstance(path, basestring):
         path = path.split('/')
 
+    value = deref_frame(tid, fid).value(key)
     while path:
         key = path[0]
         path = path[1:]
         value = get_item(value, key)
+    
+    return value
 
+@bottle.post('/t/:tid/:fid/:key')
+@bottle.post('/t/:tid/:fid/:key/:path#.*#')
+def change_slot(tid, fid, key, path=None):
+    'changes a value in a frame or object'
+    try:
+        tid, fid, key = int(tid), int(fid), str(key)
+        content_type = bottle.request.get_header('Content-Type', '')
+        if not content_type.startswith('application/json'):
+            return {"error":"new value must be provided as JSON"}
+        if path:
+            path = path.split('/')
+            value = deref_value(tid, fid, key, path[:-1])
+            key = path[-1]
+        else:
+            value = deref_frame(tid, fid)
+        data = bottle.request.json 
+    except Exception as exc:
+        #TODO: indicate that this was a deref error
+        #TODO: log all non-HTTP errors to stderr
+        return {"error":str(exc)}
+    
+    try:
+        #if isinstance(value, andbug.Array):
+            # return set_array_item(value, key)
+        if isinstance(value, andbug.Object):
+            return set_object_field(value, key, data)
+        elif isinstance(value, andbug.Frame):
+            return set_frame_slot(value, key, data)
+        return {"error":"navi can only modify object fields and frame slots"}
+    except Exception as exc:
+        #TODO: indicate that this was an assignment error
+        #TODO: log all non-HTTP errors to stderr
+        return {"error":str(exc)}
+
+def set_frame_slot(frame, key, data): #TEST
+    'changes the value of a frame slot'
+    #TODO: make sure frame.setValue throws a KeyError on failed slot update
+    try:
+        result = frame.setValue(key, data)
+    except KeyError:
+        return {"error":"navi cannot find slot %r" % key}
+    
+    if result:
+        return {}
+    return {"error":"navi could not change slot %r" % key}
+
+def set_object_field(val, key, value): #TEST
+    'changes the value of an object field'
+    try:
+        result = val.setField(key, value)
+    except KeyError:
+        return {"error":"navi cannot find field %r" % key}
+    
+    if result:
+        return {}
+    return {"error":"navi could not change field %r" % key}
+
+#def set_array_item(val, key):
+#    key = int(key)
+#
+#    try:
+#        return val[key]
+#    except KeyError:
+#        raise bottle.HTTPError(
+#            code=404, output='array does not have index %s.' % key
+#        )
+
+@bottle.route('/t/:tid/:fid/:key')
+@bottle.route('/t/:tid/:fid/:key/:path#.*#')
+def view_slot(tid, fid, key, path=None):
+    'lists the values in the frame'
+    
+    tid, fid, key = int(tid), int(fid), str(key)
+    value = deref_value(tid, fid, key, path)
     data = json.dumps(view(value))
     bottle.response.content_type = 'application/json'
     return data
@@ -264,36 +335,40 @@ def frontend():
 # on Bottle, so this could be decoupled and put under WSGIREF.
 #############################################################################
 
-def navi_loop(p):
+def navi_loop(p, address, port):
     # Look, bottle makes me do sad things..
     global proc
     proc = p
     
     bottle.debug(True)
     bottle.run(
-        host='localhost',
-        port=8080,
+        host=address,
+        port=port,
         reloader=False,
         quiet=True
     )
 
 svr = None
 
-@andbug.command.action('')
-def navi(ctxt):
+@andbug.command.action('[allowRemote=<False or anychar>] [port=<8080>]')
+def navi(ctxt, allowRemote = False, port = None):
     'starts an http server for browsing process state'
     global svr
     if svr is not None:
         andbug.screed.section('navigation process already running')
         return
 
+    address = '0.0.0.0' if allowRemote else 'localhost'
+    port = int(port) if port else 8080
+
     with andbug.screed.section(
-        'navigating process state at http://localhost:8080'
+        'navigating process state at http://localhost:%i' % port
     ):
         andbug.screed.item('Process suspended for navigation.')
         ctxt.sess.suspend()
+    
 
-
-    svr = threading.Thread(target=lambda: navi_loop(ctxt.sess))
+    svr = threading.Thread(target=lambda: navi_loop(ctxt.sess, address, port))
     svr.daemon = 1 if ctxt.shell else 0
     svr.start()
+    

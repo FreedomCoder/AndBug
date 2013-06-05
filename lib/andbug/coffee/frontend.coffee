@@ -1,3 +1,5 @@
+#!/usr/bin/env coffee
+
 last = (seq) ->
     seq[seq.length - 1]
 
@@ -43,8 +45,80 @@ object_view = (ref, jni, slots ...) ->
     div.append(layout_slots(slots, ref)) if slots.length
     return div
 
+# TODO: edit out CSS elements to a stylesheet
+# TODO: ensure these things are primitive type aware
+
+complain = (problem) ->
+    console.log(problem)
+    alert(problem)
+    #TODO: improvements needed
+
+release_value = (doc, data) ->
+    console.log("release", data)
+    text = JSON.stringify(data)
+    doc.data('data', data)
+    doc.prop('contenteditable', false).text(text).css {
+        'color':'', 'background-color':''
+    }
+
+submit_value = (doc) ->
+    try
+        new_data = $.parseJSON(doc.text())
+    catch err
+        return complain("could not parse #{new_data}: #{err}")
+    old_data = doc.data('data')
+    ref = doc.data('ref')
+
+    # if old_data is new_data, let it go..
+    return release_value(doc, old_data) if new_data == old_data
+    
+    #TODO: ensure type is consistent between new_data and old_data
+    
+    # indicate that we have started submitting..
+    doc.css('color', 'red')
+    req = post_json(doc.data('ref'), new_data)
+
+    req.success (result) ->
+        console.log(result)
+        if result.error
+            release_value(doc, old_data).css('color', 'red')
+            complain(result.error)
+        else
+            release_value(doc, new_data).css('color', 'green')
+
+    req.error (xhr, status, error) ->
+        release_value(doc).text(old_data).css('color', 'red')
+        complain(error || status)
+
+    req.complete ->
+        # after 3s, we clear the color
+        after_timeout 3000, -> doc.css({'color':''})
+
+# coffee-script hackers really prefer that funcs come last..
+after_timeout = (ms, next) -> setTimeout(next, ms)
+
+# $.post is json-stupid, so is bare $.ajax..
+post_json = (url, data) ->
+    $.ajax {
+        type:'POST', dataType:'json'
+        contentType:'application/json; charset=utf-8', 
+        url : url, data : JSON.stringify(data)}
+
+edit_value = (doc) -> 
+    doc.text(JSON.stringify(doc.data('data')))
+    doc.prop('contenteditable', true)
+    doc.css('color', 'black').css('backgroundColor', 'white')
+    doc.blur -> 
+        doc.unbind('blur')  # blur tends to bounce..
+        submit_value(doc)
+
 value_view = (ref, data) ->
-    $('<span class="val">').text(data)
+    doc = $('<span class="val">').text(data)
+    doc.data('ref', ref).data('data', data)
+    doc.click -> edit_value(doc)
+
+#value_view = (ref, data) ->
+#    $('<span class="val">').text(data)
 
 popout = (c) ->
     p = $('<div class="popout">').append(c)
@@ -63,7 +137,6 @@ popout_view = (ref, data) ->
 layout_value = (val, ref) ->
     val = $('<span class="val">').text(val)
     if ref
-        console.log(ref)
         val = $('<a>').append(val)
         val.click -> $.get(ref).success (data) -> popout_view(ref, data)
     return val
@@ -80,7 +153,6 @@ layout_items = (items, base) ->
     else if base.match(/[^\/]$/)
         base = base + '/'
 
-    console.log(items)
     slots = $('<div class="slots">')
     sz = items.length
     for ix in [0 .. sz]
@@ -113,7 +185,6 @@ layout_thread = (t) ->
     return div
 
 show_thread = (t) ->
-    console.log(t)
     $('.frame').hide()
     t.find('.frame').show()
 

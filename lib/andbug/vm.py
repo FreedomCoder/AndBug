@@ -12,7 +12,7 @@
 ## You should have received a copy of the GNU Lesser General Public License
 ## along with AndBug.  If not, see <http://www.gnu.org/licenses/>.
 
-import andbug, andbug.data, andbug.proto
+import andbug, andbug.data, andbug.proto, andbug.errors
 import threading, re
 from andbug.data import defer
 from threading import Lock
@@ -22,12 +22,15 @@ from Queue import Queue
 ## -- unpackFrom methods are used to unpack references to an element from
 ##    a JDWP buffer.  This does not mean unpacking the actual definition of
 ##    the element, which tends to be one-shot.
+##
 ## References:
 ## -- All codes that are sent to Dalvik VM where extracted from
 ##    dalvik/vm/jdwp/JdwpHandler.cpp and converted to HEX values
-##    (e.g. Resume Thread: {11, 3, ....} => 0B03)
+##    (e.g. Resume Thread: {11, 3, ....} => 0b03)
 ## -- JDWP Protocol:
-##    http://docs.oracle.com/javase/1.4.2/docs/guide/jpda/jdwp/jdwp-protocol.html
+##    dalvik implements a subset of these, verify with JdwpHandler.cpp:
+##    http://docs.oracle.com/javase/6/docs/platform/jpda/jdwp/jdwp-protocol.html
+##    
 
 class RequestError(Exception):
     'raised when a request for more information from the process fails'
@@ -145,6 +148,70 @@ class Frame(SessionElement):
 
         return vals
 
+    def value(self, name):
+        if self.native: return None
+
+        sess = self.sess
+        conn = self.conn
+        buf = conn.buffer()
+        buf.packObjectId(self.tid)
+        buf.packFrameId(self.fid)
+        slots = self.loc.slots
+        buf.packInt(1)
+
+        loc = None
+        for i in range(0, len(slots)):
+            if slots[i].name == name:
+                loc = i
+                break
+            else:
+                continue
+
+        if loc is None:
+            return None
+        slot = slots[loc]
+        buf.packInt(slot.index)
+        buf.packU8(slot.tag) #TODO: GENERICS
+
+        code, buf = conn.request(0x1001, buf.data())
+        if code != 0:
+            raise RequestError(code)
+        if buf.unpackInt() != 1:
+            return None
+
+        return unpack_value(sess, buf)
+
+    def setValue(self, name, value):
+        if self.native: return False
+
+        sess = self.sess
+        conn = self.conn
+        buf = conn.buffer()
+        buf.packObjectId(self.tid)
+        buf.packFrameId(self.fid)
+        slots = self.loc.slots
+        buf.packInt(1)
+
+        loc = None
+        for i in range(0, len(slots)):
+            if slots[i].name == name:
+                loc = i
+                break
+            else:
+                continue
+
+        if loc is None:
+            return False
+        slot = slots[loc]
+        buf.packInt(slot.index)
+        pack_value(sess, buf, value, slot.jni) #TODO: GENERICS
+
+        code, buf = conn.request(0x1002, buf.data())
+        if code != 0:
+            raise RequestError(code)
+
+        return True
+
 class Thread(SessionElement):
     #TODO: promote to Value
     def __init__(self, sess, tid):
@@ -152,24 +219,46 @@ class Thread(SessionElement):
         self.tid = tid
     
     def __str__(self):
-        return 'thread %s' % (self.name or hex(self.tid))
+        tStatus, sStatus = self.status
+        return 'thread %s\t(%s %s)' % (self.name or hex(self.tid), Thread.threadStatusStr(tStatus), Thread.suspendStatusStr(sStatus))
 
     def suspend(self):  
         conn = self.conn
         buf = conn.buffer()
         buf.packObjectId(self.tid)
-        code, buf = conn.request(0x0B01, buf.data())
+        code, buf = conn.request(0x0b02, buf.data())
         if code != 0:
             raise RequestError(code)
 
     def resume(self):
         conn = self.conn
         buf = conn.buffer()
-        buf.pack('o', self.tid)
-        code, buf = conn.request(0x0B03, buf.data())
+        buf.packObjectId(self.tid)
+        code, buf = conn.request(0x0b03, buf.data())
         if code != 0:
             raise RequestError(code)
+        #add by sq.luo
+        #self.sess.suspendState.resume(self.sess)
+    #add by sq.luo  
+    def singleStep(self, func = None, queue = None, stepdepth = 1):
+        suspendState = self.sess.suspendState
+        if suspendState.set:
+            self.sess.emap[suspendState.eid].clear()
+        conn = self.conn
+        buf = conn.buffer()
+        # 1:SINGLE_STEP, 1: SP_THREAD, 1: modifers 10: condition of Step 
+        # 1: Step size :Line 1: stepdepth: over
 
+        buf.pack('11i1tii', 1, 1, 1, 10, self.tid, 1, stepdepth) 
+        code, buf = conn.request(0x0f01, buf.data())
+        if code != 0:
+            raise RequestError(code)
+        eid = buf.unpackInt()
+        self.sess.suspendState.setBreakPoint(eid, stepdepth)
+        h = self.sess.hook(eid, func, queue, self)
+        self.resume();
+        return h
+    
     def packTo(self, buf):
         buf.packObjectId(self.tid)
 
@@ -178,7 +267,7 @@ class Thread(SessionElement):
         buf = conn.buffer()
         # 40:EK_METHOD_ENTRY, 1: SP_THREAD, 1 condition of type ClassRef (3), ThreadId
         buf.pack('11i1t', 40, 1, 1, 3, self.tid) 
-        code, buf = conn.request(0x0F01, buf.data())
+        code, buf = conn.request(0x0f01, buf.data())
         if code != 0:
             raise RequestError(code)
         eid = buf.unpackInt()
@@ -196,7 +285,7 @@ class Thread(SessionElement):
         conn = self.conn
         buf = conn.buffer()
         buf.pack('oii', self.tid, 0, -1)
-        code, buf = conn.request(0x0B06, buf.data())
+        code, buf = conn.request(0x0b06, buf.data())
         if code != 0:
             raise RequestError(code)
         ct = buf.unpackInt()
@@ -214,7 +303,7 @@ class Thread(SessionElement):
         conn = self.conn
         buf = conn.buffer()
         buf.packObjectId(self.tid)
-        code, buf = conn.request(0x0B07, buf.data())
+        code, buf = conn.request(0x0b07, buf.data())
         if code != 0:
             raise RequestError(code)
         return buf.unpackInt()
@@ -224,10 +313,40 @@ class Thread(SessionElement):
         conn = self.conn
         buf = conn.buffer()
         buf.packObjectId(self.tid)
-        code, buf = conn.request(0x0B01, buf.data())
+        code, buf = conn.request(0x0b01, buf.data())
         if code != 0:
             raise RequestError(code)
         return buf.unpackStr()
+
+    @property
+    def status(self):
+        conn = self.conn
+        buf = conn.buffer()
+        buf.packObjectId(self.tid)
+        code, buf = conn.request(0x0b04, buf.data())
+        if code != 0:
+            raise RequestError(code)
+
+        threadStatus = buf.unpackInt()
+        suspendStatus = buf.unpackInt()
+
+        return threadStatus, suspendStatus
+
+    @staticmethod
+    def threadStatusStr(tStatus):
+        szTS = ('zombie', 'running', 'sleeping', 'monitor', 'waiting', 'initializing', 'starting', 'native', 'vmwait')
+        tStatus = int(tStatus)
+        if tStatus < 0 or tStatus >= len(szTS):
+            return "UNKNOWN"
+        return szTS[tStatus]
+
+    @staticmethod
+    def suspendStatusStr(sStatus):
+        szSS = ('running', 'suspended')
+        sStatus = int(sStatus)
+        if sStatus < 0 or sStatus >= len(szSS):
+            return "UNKNOWN"
+        return szSS[sStatus]
 
 class Location(SessionElement):
     def __init__(self, sess, tid, mid, loc):
@@ -238,6 +357,8 @@ class Location(SessionElement):
         self.line = None
 
     def __str__(self):
+        if self.line != None:
+            return '%s:%i: smali line: %i' % (self.method, self.loc, self.line)
         if self.loc >= 0:
             return '%s:%i' % (self.method, self.loc)
         else:
@@ -249,17 +370,27 @@ class Location(SessionElement):
 
     @classmethod
     def unpackFrom(impl, sess, buf):
+        #modified by shiqi Luo
         tag, tid, mid, loc = buf.unpack('1tm8')
         return sess.pool(impl, sess, tid, mid, loc)
 
     def hook(self, func = None, queue = None):
         conn = self.conn
         buf = conn.buffer()
-        # 40:EK_METHOD_ENTRY, 1: SP_THREAD, 1 condition of type Location (7)
-        buf.pack('11i1', 40, 1, 1, 7) 
+        # 2: BREAKPOINT
+        # 40:METHOD_ENTRY
+        # 41:METHOD_EXIT
+        if self == self.method.firstLoc:
+            eventKind = 40
+        elif self == self.method.lastLoc:
+            eventKind = 41
+        else:
+            eventKind = 2
+        # 1: SP_THREAD, 1 condition of type Location (7)
+        buf.pack('11i1', eventKind, 1, 1, 7)
 
         self.packTo(buf)
-        code, buf = conn.request(0x0F01, buf.data())
+        code, buf = conn.request(0x0f01, buf.data())
         if code != 0:
             raise RequestError(code)
         eid = buf.unpackInt()
@@ -303,7 +434,7 @@ class Slot(SessionElement):
             return 'slot at index %i' % (self.index)
 
     def load_slot(self):
-        self.sess.pool(Class, self.sess, tid).load_slots()
+        self.sess.pool(Class, self.sess, self.tid).load_slots()
 
     firstLoc = defer(load_slot, 'firstLoc')
     locLength = defer(load_slot, 'locLength')
@@ -334,7 +465,7 @@ class Method(SessionElement):
         return '<method %s>' % self
 
     def load_line_table(self):
-        sess = self.sess
+        sess = self.sess 
         conn = sess.conn
         pool = sess.pool
         tid = self.tid
@@ -354,7 +485,7 @@ class Method(SessionElement):
         self.lastLoc = pool(Location, sess, tid, mid, l)
 
         ll = {}
-        self.lineLocs = ll
+        self.lineTable = ll
         def line_loc():
             loc, line  = buf.unpack('8i')
             loc = pool(Location, sess, tid, mid, loc)
@@ -441,7 +572,7 @@ class RefType(SessionElement):
         conn = self.conn
         buf = conn.buffer()
         buf.pack("t", self.tid)
-        code, buf = conn.request(0x020E, buf.data())
+        code, buf = conn.request(0x020e, buf.data())
         if code != 0:
             raise RequestError(code)
 
@@ -490,7 +621,7 @@ class RefType(SessionElement):
         pool = sess.pool
         buf = conn.buffer()
         buf.pack("t", tid)
-        code, buf = conn.request(0x020F, buf.data())
+        code, buf = conn.request(0x020f, buf.data())
         if code != 0:
             raise RequestError(code)
 
@@ -525,10 +656,16 @@ class RefType(SessionElement):
     methodByJni = defer(load_methods, 'methodByJni')
     methodByName = defer(load_methods, 'methodByName')
 
-    def methods(self, name=None, jni=None):
+    def methods(self, name=None, jni=None, filtername=None):
         if name and jni:
             seq = self.methodByName[name]
             seq = filter(x in seq, self.methodByJni[jni])
+        elif filtername:
+            list = []
+            for key in self.methodByName.keys():
+                if key.find(filtername) != -1:
+                    list.append(self.methodByName[key])
+            seq = andbug.data.view(list)
         elif name:
             seq = andbug.data.view(self.methodByName[name])
         elif jni:
@@ -560,12 +697,14 @@ class Class(RefType):
         buf = conn.buffer()
         # 40:EK_METHOD_ENTRY, 1: SP_THREAD, 1 condition of type ClassRef (4)
         buf.pack('11i1t', 40, 1, 1, 4, self.tid) 
-        code, buf = conn.request(0x0F01, buf.data())
+        data = buf.data()
+        print repr(data)
+        code, buf = conn.request(0x0f01, buf.data())
         if code != 0:
             raise RequestError(code)
         eid = buf.unpackInt()
         return self.sess.hook(eid, func, queue, self)
-        
+
     #def load_class(self):
     #   self.sess.load_classes()
     #   assert self.tag != None
@@ -610,8 +749,8 @@ class Hook(SessionElement):
         buf = conn.buffer()
         # 40:EK_METHOD_ENTRY
         buf.pack('1i', 40, int(self.ident))
-        # 0x0F02 = {15, 2} EventRequest.Clear
-        code, unknown = conn.request(0x0F02, buf.data())
+        # 0x0f02 = {15, 2} EventRequest.Clear
+        code, unknown = conn.request(0x0f02, buf.data())
         # fixme: check what a hell is the value stored in unknown
         if code != 0:
             raise RequestError(code)
@@ -634,14 +773,54 @@ def unpack_events(sess, buf):
         else:
             yield im(sess, buf)
 
-def unpack_method_entry(sess, buf):
+def unpack_event_location(sess, buf):
     rid = buf.unpackInt()
     t = Thread.unpackFrom(sess, buf)
     loc = Location.unpackFrom(sess, buf)
     return rid, t, loc
 
-register_unpack_impl(40, unpack_method_entry)
+# Single Step
+register_unpack_impl(1, unpack_event_location)
+# Breakpoint
+register_unpack_impl(2, unpack_event_location)
+# MothodEntry
+register_unpack_impl(40, unpack_event_location)
+# MothodExit
+register_unpack_impl(41, unpack_event_location)
 
+
+#add by sq.luo  
+class SuspendState(object):
+    def __init__(self):
+        self.isSuspend = False
+        self.thread = None
+        self.location = None
+        self.set = False
+        self.eid = 0
+    def suspend(self, data):
+        self.isSuspend = True
+        if len(data) >= 2:
+            self.thread = data[0]
+            self.location = data[1]
+        
+    def resume(self, sess):
+        self.isSuspend = False
+        self.thread = None
+        self.location = None
+        if self.set:
+            sess.emap[self.eid].clear()
+            self.set = False
+    def getThread(self):
+        return self.thread
+    
+    def getLocation(self):
+        return self.location
+    
+    def setBreakPoint(self, eid, stepdepth):
+        self.set = True
+        self.eid = eid
+        self.stepdepth = stepdepth
+        
 class Session(object):
     def __init__(self, conn):
         self.pool = andbug.data.pool()
@@ -649,6 +828,7 @@ class Session(object):
         self.emap = {}
         self.ectl = Lock()
         self.evtq = Queue()
+        self.suspendState = SuspendState()
         conn.hook(0x4064, self.evtq)
         self.ethd = threading.Thread(
             name='Session', target=self.run
@@ -656,6 +836,9 @@ class Session(object):
         self.ethd.daemon=1
         self.ethd.start()
 
+    def getSuspendState(self):
+        return self.suspendState
+    
     def run(self):
         while True:
             self.processEvent(*self.evtq.get())
@@ -673,10 +856,12 @@ class Session(object):
                 raise RequestError(ek)
             evt = im(self, buf)
             with self.ectl:
+                print evt[0]
                 hook = self.emap.get(evt[0])
             if hook is not None:
+                self.suspendState.suspend(evt[1:])
                 hook.put(evt[1:])
-                          
+        
     def load_classes(self):
         code, buf = self.conn.request(0x0114)
         if code != 0:
@@ -713,7 +898,7 @@ class Session(object):
         code, buf = self.conn.request(0x0108, '')
         if code != 0:
             raise RequestError(code)
-
+    
     @property
     def count(self):
         code, buf = self.conn.request(0x0108, '')
@@ -721,10 +906,12 @@ class Session(object):
             raise RequestError(code)
 
     def resume(self):
+        self.suspendState.resume(self)
         code, buf = self.conn.request(0x0109, '')
         if code != 0:
             raise RequestError(code)
-
+        
+        
     def exit(self, code = 0):
         conn = self.conn
         buf = conn.buffer()
@@ -749,14 +936,16 @@ class Session(object):
             if rx_dalvik_tname.match(name):
                 seq = (t for t in seq if t.name == name)
             else:
-                seq = (t for t in seq if t.name.split(' ',1)[-1] == name)
+                name = str(name)
+                name = name if not re.match('^\d+$', name) else '<' + name + '>'
+                seq = (t for t in seq if name in t.name.split(' ',1))
         return andbug.data.view(seq)
 
 rx_dalvik_tname = re.compile('^<[0-9]+> .*$')
 
 class Object(Value):
     def __init__(self, sess, oid):
-        if oid == 0: raise VoidError()
+        if oid == 0: raise andbug.errors.VoidError()
         SessionElement.__init__(self, sess)
         self.oid = oid
 
@@ -827,6 +1016,61 @@ class Object(Value):
             vals[f.name] = unpack_value(sess, buf)
 
         return vals
+
+    def field(self, name):
+        sess = self.sess
+        conn = self.conn
+        buf = conn.buffer()
+        buf.packTypeId(self.oid)
+        fields = self.fieldList
+        buf.packInt(1)
+
+        loc = None
+        for i in range(0, len(fields)):
+            if fields[i].name == name:
+                loc = i
+                break
+            else:
+                continue
+
+        if loc is None:
+            return None
+        field = fields[loc]
+        buf.packFieldId(field.fid)
+        code, buf = conn.request(0x0902, buf.data())
+        if code != 0:
+            raise RequestError(code)
+        if buf.unpackInt() != 1:
+            return None
+        return unpack_value(sess, buf)
+
+
+    def setField(self, name, value):
+        sess = self.sess
+        conn = self.conn
+        buf = conn.buffer()
+        buf.packTypeId(self.oid)
+        fields = self.fieldList
+        buf.packInt(1)
+
+        loc = None
+        for i in range(0, len(fields)):
+            if fields[i].name == name:
+                loc = i
+                break
+            else:
+                continue
+
+        if loc is None:
+            return None
+        field = fields[loc]
+        buf.packFieldId(field.fid)
+        #TODO: WTF: ord(field.jni) !?
+        pack_value(sess, buf, value, field.jni[0])
+        code, buf = conn.request(0x0903, buf.data())
+        if code != 0:
+            raise RequestError(code)
+        return True
 
 ## with andbug.screed.item(str(obj)):
 ##     if hasattr(obj, 'dump'):
@@ -954,6 +1198,34 @@ def unpack_value(sess, buf, tag = None):
         raise RequestError(tag)
     else:
         return fn(sess, buf)
+
+pack_value_impl = [None,] * 256
+def register_pack_value(tag, func):
+    for t in tag:
+        pack_value_impl[ord(t)] = func
+
+register_pack_value('B', lambda p, b, v: b.packU8(int(v)))
+register_pack_value('F', lambda p, b, v: b.packFloat(float(v))) #TODO: TEST
+register_pack_value('D', lambda p, b, v: b.packDouble(float(v))) #TODO:TEST
+register_pack_value('I', lambda p, b, v: b.packInt(int(v)))
+register_pack_value('J', lambda p, b, v: b.packLong(long(v)))
+register_pack_value('S', lambda p, b, v: b.packShort(int(v))) #TODO: TEST
+register_pack_value('V', lambda p, b, v: b.packVoid())
+register_pack_value('Z', lambda p, b, v: b.packU8(bool(v) and 1 or 0))
+#register_pack_value('s', lambda p, b, v: b.packStr(v)) # TODO: pack String
+
+def pack_value(sess, buf, value, tag = None):
+    if not tag:
+        raise RequestError(tag)
+    if isinstance(tag, basestring):
+        tag = ord(tag[0])
+    print "PACK", repr(tag), repr(value)
+    fn = pack_value_impl[tag]
+    if fn is None:
+        raise RequestError(tag)
+    else:
+        buf.packU8(tag)
+        return fn(sess, buf, value)
 
 def connect(pid, dev=None):
     'connects using proto.forward() to the process associated with this context'
